@@ -24,7 +24,7 @@ async def send_reminder(chat_id: int, text: str):
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
-        "Привет! Я напоминалка. ⏰\n"
+        ""Привет! Я бот-напоминалка. ⏰\n\nИспользуй:\n/remind ЧЧ:ММ текст — чтобы создать напоминание\n/list — чтобы посмотреть активные задачи""
         "Формат: /remind 15:30 сдать отчёт"
     )
  
