@@ -14,7 +14,8 @@ TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 scheduler = scheduler = AsyncIOScheduler(timezone="Asia/Bishkek")
- 
+# Список напоминаний: каждый элемент — словарь {"time": ..., "text": ...}
+reminders = []
 async def send_reminder(chat_id: int, text: str):
     """Эта функция сработает в назначенное время."""
     await bot.send_message(chat_id, f"⏰ НАПОМИНАНИЕ: {text}")
@@ -61,19 +62,28 @@ async def cmd_remind(message: Message, command: CommandObject):
     if run_at <= datetime.now():
         run_at += timedelta(days=1)
  
-    scheduler.add_job(
-        send_reminder,
-        trigger="date",
-        run_date=run_at,
-        args=[message.chat.id, text],
-    )
+    scheduler.add_job( send_reminder, trigger="date", run_date=run_at, args=[message.chat.id, text], )
+    reminders.append({"time": run_at, "text": text})
  
     await message.answer(
         f"✅ Запомнила! Напомню «{text}» "
         f"{run_at.strftime('%d.%m в %H:%M')}"
     )
  
+@dp.message(Command("list"))
+async def cmd_list(message: Message):
+    # Оставляем только те, чьё время ещё не наступило
+    active = [r for r in reminders if r["time"] > datetime.now()]
  
+    if not active:
+        await message.answer("Активных напоминаний нет 📭")
+        return
+ 
+    lines = [
+        f"• {r['time'].strftime('%d.%m %H:%M')} — {r['text']}"
+        for r in sorted(active, key=lambda r: r["time"])
+    ]
+    await message.answer("Твои напоминания:\n" + "\n".join(lines))
 async def main():
     scheduler.start()
     print("Бот запущен. Остановка: Ctrl+C")
