@@ -1,3 +1,4 @@
+import sqlite3
 import asyncio 
 import os
 from datetime import datetime, timedelta
@@ -15,13 +16,84 @@ TOKEN = os.getenv("BOT_TOKEN")
 WEATHER_KEY = "18406235f038f1ba6d2eba077bf23acf"  
 CITY = "Bishkek"  
 MY_CHAT_ID = 5190913819  
-
+DB = "reminders.db"
  
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone="Asia/Bishkek")
-reminders = []
 
+
+# ---------- База данных (Этап 2) ----------
+ 
+def db_init():
+    """Создает таблицу напоминаний, если её еще нет."""
+    with sqlite3.connect(DB) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS reminders ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "chat_id INTEGER, run_at TEXT, text TEXT)"
+        )
+ 
+ 
+def db_add(chat_id, run_at, text):
+    """Добавляет новое напоминание в базу и возвращает его ID."""
+    with sqlite3.connect(DB) as conn:
+        cur = conn.execute(
+            "INSERT INTO reminders (chat_id, run_at, text) VALUES (?, ?, ?)",
+            (chat_id, run_at.isoformat(), text),
+        )
+        return cur.lastrowid  # id новой записи
+ 
+ 
+def db_delete(reminder_id):
+    """Удаляет напоминание из базы по ID."""
+    with sqlite3.connect(DB) as conn:
+        conn.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+ 
+ 
+def db_all():
+    """Возвращает список всех напоминаний из базы."""
+    with sqlite3.connect(DB) as conn:
+        rows = conn.execute(
+            "SELECT id, chat_id, run_at, text FROM reminders"
+        ).fetchall()
+    return [
+        {"id": r[0], "chat_id": r[1],
+         "time": datetime.fromisoformat(r[2]), "text": r[3]}
+        for r in rows
+    ]
+
+
+# ---------- Планировщик ----------
+
+async def send_reminder(reminder_id, chat_id, text):
+    """Эта функция сработает в назначенное время."""
+    await bot.send_message(chat_id, f"⏰ НАПОМИНАНИЕ: {text}")
+    db_delete(reminder_id)  # сработало — удаляем из базы
+
+
+def schedule_reminder(reminder_id, chat_id, run_at, text):
+    """Регистрирует задачу в APScheduler."""
+    scheduler.add_job(
+        send_reminder, trigger="date", run_date=run_at,
+        args=[reminder_id, chat_id, text],
+        id=str(reminder_id),  # id задачи = id записи для возможности удаления
+    )
+
+
+def restore_reminders():
+    """При старте бота возвращает в планировщик всё, что не успело сработать."""
+    restored = 0
+    for r in db_all():
+        if r["time"] > datetime.now():
+            schedule_reminder(r["id"], r["chat_id"], r["time"], r["text"])
+            restored += 1
+        else:
+            db_delete(r["id"])  # удаляем старые просроченные напоминания
+    print(f"Восстановлено напоминаний из базы: {restored}")
+
+
+# ---------- Клавиатуры ----------
 
 def get_weather_keyboard() -> InlineKeyboardMarkup:
     keyboard = InlineKeyboardBuilder()
@@ -29,24 +101,7 @@ def get_weather_keyboard() -> InlineKeyboardMarkup:
     return keyboard.as_markup()
 
 
-def get_list_keyboard(current_index: int, total_count: int) -> InlineKeyboardMarkup:
-    """Создает кнопки со значками-стрелками для прокрутки на часах."""
-    keyboard = InlineKeyboardBuilder()
-    
-    prev_idx = current_index - 1 if current_index > 0 else total_count - 1
-    next_idx = current_index + 1 if current_index < total_count - 1 else 0
-    
-    keyboard.row(
-        InlineKeyboardButton(text="◀️ Назад", callback_data=f"scroll_{prev_idx}"),
-        InlineKeyboardButton(text=f"📍 {current_index + 1}/{total_count}", callback_data="ignore"),
-        InlineKeyboardButton(text="Дальше ▶️", callback_data=f"scroll_{next_idx}")
-    )
-    return keyboard.as_markup()
-
-
-async def send_reminder(chat_id: int, text: str):
-    """Эта функция сработает в назначенное время."""
-    await bot.send_message(chat_id, f"⏰ НАПОМИНАНИЕ: {text}")
+# ---------- Обработчики команд ----------
  
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
@@ -54,7 +109,7 @@ async def cmd_start(message: Message):
         "Привет! Я бот-напоминалка.\n\n"
         "Используй:\n"
         "/remind ЧЧ:ММ текст — чтобы создать напоминание\n"
-        "/list — скролл-список задач 📱\n"
+        "/list — список задач с кнопками удаления 📋\n"
         "/weather — узнать погоду\n"
         "/id — узнать свой chat_id"
     )
@@ -74,7 +129,6 @@ async def cmd_remind(message: Message, command: CommandObject):
  
     time_str, text = parts
  
-    # Разбираем время ЧЧ:ММ
     try:
         hour, minute = map(int, time_str.split(":"))
         run_at = datetime.now().replace(
@@ -89,8 +143,9 @@ async def cmd_remind(message: Message, command: CommandObject):
     if run_at <= datetime.now():
         run_at += timedelta(days=1)
  
-    scheduler.add_job(send_reminder, trigger="date", run_date=run_at, args=[message.chat.id, text])
-    reminders.append({"time": run_at, "text": text})
+    # Сохраняем в базу данных и планируем в планировщике
+    reminder_id = db_add(message.chat.id, run_at, text)
+    schedule_reminder(reminder_id, message.chat.id, run_at, text)
  
     await message.answer(
         f"✅ Запомнила! Напомню «{text}» "
@@ -98,64 +153,53 @@ async def cmd_remind(message: Message, command: CommandObject):
     )
 
 
-# --- ТЕПЕРЬ ТУТ ВСЁ ИСПРАВЛЕНО И БУДЕТ РАБОТАТЬ! ---
+# ---------- Новые Inline-кнопки в /list (Этап 3) ----------
+
 @dp.message(Command("list"))
 async def cmd_list(message: Message):
-    # Оставляем только те, чьё время ещё не наступило
-    active = [r for r in reminders if r["time"] > datetime.now()]
+    """Выводит каждое напоминание отдельным сообщением с кнопкой «Удалить»."""
+    active = [r for r in db_all() if r["time"] > datetime.now()]
     
-    # Теперь "Активных напоминаний нет" отправится ТОЛЬКО если список действительно пустой
     if not active:
         await message.answer("Активных напоминаний нет 📭")
         return
 
-    active_sorted = sorted(active, key=lambda r: r["time"])
-    total = len(active_sorted)
-    
-    first_item = active_sorted[0]
-    text = (
-        f"📋 **Твои напоминания (Скроллер):**\n\n"
-        f"🔔 **Задача:** {first_item['text']}\n"
-        f"📅 **Время:** {first_item['time'].strftime('%d.%m в %H:%M')}"
+    await message.answer(f"Активных напоминаний: {len(active)}")
+    for r in sorted(active, key=lambda r: r["time"]):
+        # Создаем индивидуальную кнопку удаления под каждым напоминанием
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="❌ Удалить",
+                callback_data=f"del:{r['id']}",
+            )
+        ]])
+        await message.answer(
+            f"• {r['time'].strftime('%d.%m %H:%M')} — {r['text']}",
+            reply_markup=kb,
+        )
+
+
+@dp.callback_query(F.data.startswith("del:"))
+async def cb_delete(callback: CallbackQuery):
+    """Обрабатывает нажатие на кнопку «❌ Удалить»."""
+    reminder_id = int(callback.data.split(":")[1])
+
+    db_delete(reminder_id)
+    try:
+        scheduler.remove_job(str(reminder_id))  # убираем задачу из планировщика
+    except Exception:
+        pass  # если задачи уже нет, то не страшно
+
+    await callback.answer("Удалено ✅")  # убирает крутилку-спиннер на кнопке
+    await callback.message.edit_text(     # меняет текст сообщения прямо в чате
+        f"🗑 {callback.message.text} — удалено"
     )
-    await message.answer(text, reply_markup=get_list_keyboard(0, total), parse_mode="Markdown")
 
 
-@dp.callback_query(F.data.startswith("scroll_"))
-async def process_scrolling(callback: CallbackQuery):
-    """Срабатывает при прокрутке напоминаний на часах или телефоне."""
-    index = int(callback.data.split("_")[1])
-    active = [r for r in reminders if r["time"] > datetime.now()]
-    
-    if not active:
-        await callback.message.edit_text("Активных напоминаний больше нет 📭")
-        await callback.answer()
-        return
-        
-    active_sorted = sorted(active, key=lambda r: r["time"])
-    total = len(active_sorted)
-    
-    if index >= total:
-        index = 0
-        
-    item = active_sorted[index]
-    text = (
-        f"📋 **Твои напоминания (Скроллер):**\n\n"
-        f"🔔 **Задача:** {item['text']}\n"
-        f"📅 **Время:** {item['time'].strftime('%d.%m в %H:%M')}"
-    )
-    
-    await callback.message.edit_text(text, reply_markup=get_list_keyboard(index, total), parse_mode="Markdown")
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "ignore")
-async def process_ignore(callback: CallbackQuery):
-    await callback.answer()
-
+# ---------- Погода и утренний брифинг (Этап 4) ----------
 
 async def get_weather() -> str:
-    """Запрашивает погоду у OpenWeather и собирает текст сообщения."""
+    """Запрашивает погоду у OpenWeather."""
     url = "https://api.openweathermap.org/data/2.5/weather"
     params = {
         "q": CITY,
@@ -208,16 +252,38 @@ async def process_refresh_weather(callback: CallbackQuery):
         await callback.answer("Уже актуально!")
 
 
-# --- ТЕПЕРЬ ТУТ ТОЖЕ ВСЁ ИСПРАВЛЕНО! ---
-async def send_morning_weather():
-    text = await get_weather()
-    await bot.send_message(MY_CHAT_ID, "Доброе утро! ☀️\n" + text, reply_markup=get_weather_keyboard())
+async def send_morning_briefing():
+    """Финальный утренний брифинг: объединяет погоду и планы на сегодня."""
+    weather = await get_weather()
+
+    # Берем из базы только сегодняшние задачи, которые еще не наступили
+    today = [
+        r for r in db_all()
+        if r["time"].date() == datetime.now().date()
+        and r["time"] > datetime.now()
+    ]
+    
+    if today:
+        plans = "\n".join(
+            f"• {r['time'].strftime('%H:%M')} — {r['text']}"
+            for r in sorted(today, key=lambda r: r["time"])
+        )
+        plans_block = f"\n\n📋 Сегодня:\n{plans}"
+    else:
+        plans_block = f"\n\n📋 На сегодня напоминаний нет."
+
+    await bot.send_message(
+        MY_CHAT_ID, "Доброе утро! ☀️\n" + weather + plans_block
+    )
 
  
 async def main():
-    # Настрой время рассылки на 2 минуты вперед от текущего времени на твоем компьютере!
-    # Например, если сейчас 12:10, поставь hour=12, minute=12
-    scheduler.add_job(send_morning_weather, trigger="cron", hour=12, minute=23)
+    db_init()            # 1. Инициализируем базу данных SQLite
+    restore_reminders()  # 2. Восстанавливаем сохраненные напоминания при старте
+    
+    # Регистрация ежедневной утренней рассылки брифинга
+    # (Для моментального теста: поставь время на 2 минуты вперед от текущего на ПК!)
+    scheduler.add_job(send_morning_briefing, trigger="cron", hour=8, minute=0)
     
     scheduler.start()
     print("Бот запущен. Остановка: Ctrl+C")
